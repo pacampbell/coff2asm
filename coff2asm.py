@@ -73,8 +73,13 @@ class CoffFile(object):
                 self.sections.append(self.read_section(in_file, section))
             # Populate section data
             for section in self.sections:
+                Log.success('Loading Section: {}'.format(section.name))
                 in_file.seek(section.scnptr)
                 section.data = in_file.read(section.size)
+            # Close the input file
+            in_file.close()
+        else:
+            Log.error('The file {} does not exist'.format(input_file))
 
     def read_coff_header(self, input_file):
         """
@@ -280,8 +285,125 @@ class CoffFile(object):
         c_string = struct.unpack('8s', input_file.read(8))[0]
         section_name = ''
         for c in c_string:
+            if c == 0:
+                break
             section_name += chr(c)
         return section_name
+
+
+class Decoder(object):
+
+    """Decodes mips 32-bit instructions into human readable assembly"""
+
+    regs = ['$zero', '$at', '$v0', '$v1', '$a0', '$a1', '$a2', '$a3', '$t0',
+            '$t1', '$t2', '$t3', '$t4', '$t5', '$t6', '$t7', '$s0', '$s1',
+            '$s2', '$s3', '$s4', '$s5', '$s6', '$s7', '$t8', '$t9', '$k0',
+            '$k1', '$gp', '$sp', '$fp', '$ra']
+
+    def __init__(self):
+        # TODO: Load instruction lists and print formats
+        pass
+
+    def decode(self, instruction, output):
+        """
+        Parses a single MIPS instruction and writes it to file.
+
+                +--------+--------+--------+--------+--------+--------+
+        R-Type  | opcode | rs     | rt     | rd     | shamt  | func   |
+                +--------+--------+--------+--------+--------+--------+
+                | 6-bits | 5-bits | 5-bits | 5-bits | 5-bits | 5-bits |
+                +--------+--------+--------+--------+--------+--------+
+
+                +--------+--------+--------+--------------------------+
+        I-Type  | opcode | rs     | rt     | immediate                |
+                +--------+--------+--------+--------------------------+
+                | 6-bits | 5-bits | 5-bits | 16-bits                  |
+                +--------+--------+--------+--------------------------+
+
+                +--------+--------------------------------------------+
+        J-Type  | opcode | address                                    |
+                +--------+--------------------------------------------+
+                | 6-bits | 26-bits                                    |
+                +--------+--------------------------------------------+
+
+                +--------+--------+--------+--------+--------+--------+
+        FR-Type | opcode | fmt    | ft     | fs     | fd     | func   |
+                +--------+--------+--------+--------+--------+--------+
+                | 6-bits | 5-bits | 5-bits | 5-bits | 5-bits | 6-bits |
+                +--------+--------+--------+--------+--------+--------+
+
+                +--------+--------+--------+--------------------------+
+        FI-Type | opcode | fmt    | ft     | immediate                |
+                +--------+--------+--------+--------------------------+
+                | 6-bits | 5-bits | 5-bits | 16-bits                  |
+                +--------+--------+--------+--------------------------+
+
+        1) If the opcode is 0 the instruction is a general purpose R-type instr
+        2) If the opcode is 2 or 3 the instruction is a J-type Instruction
+        3) If the opcode is 17 and the fmt is 16 the instruction is fp.s - FR
+        4) If the opcode is 17 and the fmt is 17 the instruction is fp.d - FR
+        5) If the opcode is 17, fmt is 8, and ft is 0, or 1 - FI
+        6) Otherwise it must be an I-type instruction
+
+        There is a couple of special cases:
+        Move from control: mfc0
+        R-Type opcode = 10, RS = 0, func = 0
+
+        @param instruction 32-bit MIPS instruction to decode.
+        @param output The human readable assembly file to write to.
+        """
+        opcode = self.extractOpcode(instruction)
+        if opcode == 2 or opcode == 3:
+            # J-type instruction
+            Log.info('{:08x} is J-Type'.format(instruction))
+        elif opcode == 0 or opcode == 16:
+            # R-type instruction
+            Log.info('{:08x} is R-Type'.format(instruction))
+        elif opcode == 17:
+            fmt = self.extractFMT(instruction)
+            if fmt == 8:
+                Log.info('{:08x} is FI-Type'.format(instruction))
+            elif fmt == 16:
+                Log.info('{:08x} is FR-Type fp.s'.format(instruction))
+            elif fmt == 17:
+                Log.info('{:08x} is FR-Type fp.d'.format(instruction))
+        else:
+            # I-Type instruction
+            Log.info('{:08x} is I-Type'.format(instruction))
+
+    def extractRS(self, instruction):
+        return self.extract(instruction, 21, 25)
+
+    def extractRT(self, instruction):
+        return self.extract(instruction, 16, 20)
+
+    def extractRD(self, instruction):
+        return self.extract(instruction, 11, 15)
+
+    def extractSHAMT(self, instruction):
+        return self.extract(instruction, 6, 10)
+
+    def extractOpcode(self, instruction):
+        return self.extract(instruction, 26, 31)
+
+    def extractFmt(self, instruction):
+        return self.extract(instruction, 21, 25)
+
+    def extractFunc(self, instruction):
+        return self.extract(instruction, 0, 5)
+
+    def extractImmediate16(self, instruction):
+        return self.extract(instruction, 0, 15)
+
+    def extractImmediate26(self, instruction):
+        return self.extract(instruction, 0, 25)
+
+    def extract(self, instruction, start, end):
+        mask = (1 << (end + 1 - start)) - 1
+        return self.rshift(instruction, start) & mask
+
+    def rshift(self, val, n):
+        return (val % 0x100000000) >> n
 
 
 class Log(object):
@@ -321,12 +443,41 @@ class Log(object):
             print("{}{}{}".format(Log.SUCCESS, msg, Log.ENDC))
 
 
+def disassemble(output_path, coff_file):
+    # Create the decoder
+    decoder = Decoder()
+    # Create the output file
+    output = open(output_path, 'w')
+    # Write comments at top of file
+    output.write('# Created by Coff2Asm\n')
+    output.write('# NOTE: Must be executed with delayed branching enabled in \
+MARS\n')
+    # Start reading the sections
+    for section in coff_file.sections:
+        if section.name == '.text':
+            output.write('{}\n'.format(section.name))
+            offset = 0
+            while offset < section.size:
+                # Extract the integer from the data
+                instruction = struct.unpack('<I',
+                                            section.data[offset:offset+4])[0]
+                # Decode the instruction and write it to file
+                decoder.decode(instruction, output)
+                # Get the next 4 bytes
+                offset += 4
+        elif section.name == '.data':
+            output.write('{}\n'.format(section.name))
+        else:
+            Log.warn('Unknown section. Unable to create.')
+    output.close()
+
+
 def main(args=None):
     Log.LOGGING_ENABELED = args.debug
     # Read in the important parts from the COFF file
     coff = CoffFile(args.coff_file)
-    # Convert the information back into a .asm file
-    # args.asm_file
+    # Disassemble the coff file
+    disassemble(args.asm_file, coff)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Coff2Asm')
