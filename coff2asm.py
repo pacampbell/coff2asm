@@ -50,7 +50,6 @@ class CoffFile(object):
         """Read in and parse a COFF file"""
         self.sections = []
         self.coff_file = coff_file
-        self.output_file = output_file
         self.parse(coff_file)
 
     def parse(self, input_file):
